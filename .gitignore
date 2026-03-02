@@ -1,0 +1,19 @@
+# Build
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+Makefile
+cmake_install.cmake
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+*.wal
+
+# IDE
+.vscode/
+.idea/
+
