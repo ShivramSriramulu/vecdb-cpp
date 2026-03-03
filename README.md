@@ -194,6 +194,9 @@ Ensures crash safety:
 - **Filtered search:** Implemented as “oversample (k×5) then filter in memory.” No index-level filtering; heavy filtering can hurt latency.
 - **Concurrency:** Single writer (insert/insert_batch) vs many readers (search) via `shared_mutex`; no transactions or multi-versioning.
 - **Parameters:** Defaults (e.g. M=16, efConstruction=50, efSearch=100) are tuned for small/medium datasets; large N may need different tuning.
+- **Storage vs index separation:** In this implementation the HNSW index owns the vectors and the graph, and `Collection` owns only metadata. There is no dedicated `Storage` layer that owns all data and lets indexes store only IDs, so swapping storage backends or adding more index types would require more refactoring.
+- **Pluggable index vs persistence:** The in-memory API is pluggable via `IIndex`, but on-disk persistence is tied to `HNSWIndex` (via `dynamic_cast`). Supporting a different ANN index that can also be saved/loaded would need a new format and some extra plumbing.
+- **Future direction (not implemented):** A more textbook design would give `Collection` a `Storage` (vectors + metadata) and one or more `IIndex` implementations that store only IDs and ask `Storage` for vectors. This would make it easier to add delete/update and multiple index types, at the cost of extra complexity.
 
 ### Transactions & WAL
 - **Transactions:** Minimal, single-writer transactions via `Transaction` (no isolation levels, no MVCC).
