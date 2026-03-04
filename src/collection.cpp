@@ -14,6 +14,8 @@ std::string meta_path(const std::string& path) {
     return path + ".meta";
 }
 
+}  // namespace
+
 void write_metadata(const std::string& path,
                     const std::unordered_map<VectorID, Metadata>& metadata) {
     std::ofstream out(path, std::ios::binary);
@@ -70,20 +72,34 @@ std::unordered_map<VectorID, Metadata> read_metadata(const std::string& path) {
     return metadata;
 }
 
-}  // namespace
-
 Collection::Collection(std::unique_ptr<IIndex> index)
-    : index_(std::move(index)) {}
+    : storage_(), index_(std::move(index)) {}
 
 Collection::Collection(std::unique_ptr<IIndex> index,
                        std::unordered_map<VectorID, Metadata> metadata)
-    : index_(std::move(index)), metadata_(std::move(metadata)) {}
+    : storage_(), index_(std::move(index)), metadata_(std::move(metadata)) {}
+
+Collection::Collection(Collection&& other) noexcept
+    : storage_(std::move(other.storage_)),
+      index_(std::move(other.index_)),
+      metadata_(std::move(other.metadata_)),
+      mutex_() {}
+
+Collection& Collection::operator=(Collection&& other) noexcept {
+    if (this != &other) {
+        storage_ = std::move(other.storage_);
+        index_ = std::move(other.index_);
+        metadata_ = std::move(other.metadata_);
+    }
+    return *this;
+}
 
 void Collection::insert(VectorID id, const Vector& vec,
                         const Metadata& meta) {
     std::unique_lock lock(mutex_);
-    index_->insert(id, vec);
+    storage_.put(id, vec, meta);
     metadata_[id] = meta;
+    index_->insert(id, vec);
 }
 
 void Collection::insert_batch(const std::vector<std::pair<VectorID, Vector>>& items,
@@ -91,9 +107,23 @@ void Collection::insert_batch(const std::vector<std::pair<VectorID, Vector>>& it
     std::unique_lock lock(mutex_);
     for (size_t i = 0; i < items.size(); ++i) {
         const auto& [id, vec] = items[i];
+        const Metadata& meta = (i < metas.size()) ? metas[i] : Metadata{};
+        storage_.put(id, vec, meta);
+        metadata_[id] = meta;
         index_->insert(id, vec);
-        metadata_[id] = (i < metas.size()) ? metas[i] : Metadata{};
     }
+}
+
+void Collection::erase(VectorID id) {
+    std::unique_lock lock(mutex_);
+    storage_.erase(id);
+    metadata_.erase(id);
+    index_->erase(id);
+}
+
+void Collection::update(VectorID id, const Vector& vec, const Metadata& meta) {
+    erase(id);
+    insert(id, vec, meta);
 }
 
 std::vector<VectorID> Collection::search(const Vector& query, size_t k) {
@@ -112,11 +142,11 @@ std::vector<VectorID> Collection::search_filtered(const Vector& query,
 
     std::vector<VectorID> result;
     for (auto id : candidates) {
-        auto it = metadata_.find(id);
-        if (it == metadata_.end()) continue;
+        auto meta_opt = storage_.get_metadata(id);
+        if (!meta_opt) continue;
 
-        auto meta_it = it->second.find(key);
-        if (meta_it == it->second.end()) continue;
+        auto meta_it = meta_opt->find(key);
+        if (meta_it == meta_opt->end()) continue;
 
         if (meta_it->second == value) {
             result.push_back(id);
@@ -128,18 +158,26 @@ std::vector<VectorID> Collection::search_filtered(const Vector& query,
 
 void Collection::save(const std::string& path) const {
     std::shared_lock lock(mutex_);
-    auto* hnsw = dynamic_cast<HNSWIndex*>(index_.get());
-    if (!hnsw)
-        throw std::runtime_error("Collection::save requires HNSWIndex");
-    hnsw->save(path);
+    index_->save(path);
     write_metadata(meta_path(path), metadata_);
+}
+
+void Collection::repopulate_storage_from_index() {
+    auto* hnsw = dynamic_cast<HNSWIndex*>(index_.get());
+    if (!hnsw) return;
+    for (const auto& [id, meta] : metadata_) {
+        auto v = hnsw->get_vector(id);
+        if (v) storage_.put(id, *v, meta);
+    }
 }
 
 Collection Collection::load(const std::string& path) {
     auto index = std::make_unique<HNSWIndex>();
-    index->load(path);
+    index->load(path);  // supports both new (type_id) and old (no type_id) format
     auto metadata = read_metadata(meta_path(path));
-    return Collection(std::move(index), std::move(metadata));
+    Collection coll(std::move(index), std::move(metadata));
+    coll.repopulate_storage_from_index();
+    return std::move(coll);
 }
 
 }  // namespace vecdb

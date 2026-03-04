@@ -1,6 +1,6 @@
 # VecDb — Vector Database (C++)
 
-VecDB is a minimal standalone vector database implemented in C++17 featuring a hierarchical HNSW index, persistence, metadata filtering, concurrency control, and crash-safe transactions via a write-ahead log (WAL). Built for efficient high-dimensional similarity search.
+VecDB is a minimal standalone vector database in C++17. It uses an **HNSW index** for fast approximate nearest-neighbor search, with persistence, metadata filtering, concurrency control, and crash-safe transactions (WAL). This document explains how to build and run it, how the API and architecture work, and how HNSW compares to a brute-force baseline.
 
 ---
 
@@ -28,6 +28,8 @@ cmake --build .
 ---
 
 ## 2. API Reference
+
+You talk to VecDB through a **Collection**: you give it an index (usually HNSW), then call insert, search, search_filtered, save, and load. Types and main calls are below.
 
 ### Types (`vecdb/types.hpp`)
 - `Vector` = `std::vector<float>`
@@ -60,6 +62,10 @@ std::vector<std::pair<vecdb::VectorID, vecdb::Vector>> items = { {0, v0}, {1, v1
 std::vector<vecdb::Metadata> metas = { meta0, meta1, ... };
 collection.insert_batch(items, metas);
 
+// Remove or update a document
+collection.erase(id);
+collection.update(id, new_vector, new_metadata);
+
 // Persist full collection (index + metadata) and reload after restart
 collection.save("my_collection.bin");
 vecdb::Collection loaded = vecdb::Collection::load("my_collection.bin");
@@ -83,30 +89,36 @@ auto results = loaded.search(query, k);
 - **OLAP:** Bulk load: `insert_batch(items, metas)` to ingest many vectors under one lock; then run batch or ad-hoc `search` / `search_filtered` over the built index.
 
 ### Data layout
-- **Index:** Pluggable via `IIndex`; default implementation is `HNSWIndex` (vectors + graph only).
-- **Collection:** Owns one `IIndex` and a `metadata_` map; provides insert, search, and search_filtered with a shared mutex for concurrency.
+- **Storage:** Data layer (`Storage` / `InMemoryStorage`): vectors + metadata per id; used by Collection for all puts and metadata lookups.
+- **Index:** Pluggable via `IIndex` (insert, erase, search, save, load); default is `HNSWIndex` (vectors + graph).
+- **Collection:** Public API: owns `InMemoryStorage` + one `IIndex`; exposes insert, insert_batch, erase, update, search, search_filtered, save, load; uses a shared mutex for concurrency.
 
 ---
 
 ## 3. Design Doc
 
+This section describes how VecDB is built: the main components (Storage, Index, Collection, WAL) and how data and search work.
+
 ### Architecture
-- **Collection** = database layer: owns index + metadata, exposes insert, insert_batch, search, search_filtered, save, load; handles concurrency (read/write locks).
-- **IIndex** = search engine interface: insert(id, vector), search(query, k).
-- **HNSWIndex** = HNSW implementation: only vectors and graph; no metadata. Implements save/load for the graph.
+- **Storage** = data layer: stores vectors and metadata per id. `InMemoryStorage` implements `put(id, vec, meta)`, `get(id)`, `get_metadata(id)`, `erase(id)`. Collection uses it as the single place for document data.
+- **IIndex** = search engine interface: `insert`, `erase`, `search`, `save(path)`, `load(path)`. Persistence is pluggable: no `dynamic_cast` in Collection::save; index file starts with a type id for future index types.
+- **Collection** = public API: owns `InMemoryStorage` + one `IIndex`; exposes insert, insert_batch, erase, update, search, search_filtered, save, load; handles concurrency (read/write locks). Insert/update write to Storage and Index; search_filtered reads metadata from Storage.
+- **HNSWIndex** = HNSW implementation: vectors + graph; implements erase and save/load (with type id in file for backward compatibility).
 
-Separation: indexing and storage are separate. Collection::save/load persist both the index (via HNSWIndex) and metadata (in a separate `.meta` file).
+Separation: **Storage** (data), **IIndex** (indexing), and **Collection** (API) are separate. Collection::save/load call `index_->save(path)` and write metadata to `path.meta`.
 
-### HNSW data structures
-- **Node:** `VectorID id`, `Vector vector`, `int level`, `unordered_map<int, vector<VectorID>> neighbors` (neighbors per layer).
-- **Globals:** `entry_point_`, `max_level_`, `M_`, `efConstruction_`, `efSearch_`.
-- **Construction:** Upper layers use greedy routing; at each level we run `search_layer` (efConstruction beam search), sort candidates by distance to the new vector, connect to closest M, prune with distance-cached `nth_element`, then set next-level entry to best candidate (no extra greedy step in the construction loop).
-- **Search:** Greedy descent on upper layers; at layer 0, efSearch beam search (candidate + result heaps, visited set), then return top-k.
+### HNSW data structures (for the curious)
+
+- **Node:** each vector is a node with `id`, `vector`, `level`, and `neighbors` per layer.
+- **Globals:** entry point, max level, and parameters M, efConstruction, efSearch.
+- **Construction:** For each new vector we do greedy routing on upper layers, then at each level run a beam search (efConstruction), connect to the M nearest neighbors, and promote the best candidate to the next level.
+- **Search:** Greedy descent on upper layers; on the bottom layer we run a beam search (efSearch) and return the top-k nearest neighbors.
 
 ### Persistence strategy
-- **Index:** Binary file: globals (entry_point, max_level, M, efConstruction, efSearch), node count, then per node: id, level, vector dimension + raw floats, then per level: level id, neighbor count, neighbor IDs.
-- **Metadata:** `Collection::save(path)` writes the index to `path` and metadata to `path.meta` (binary: per-id key-value pairs). `Collection::load(path)` reads both and returns a new Collection.
-- **Usage:** Call `collection.save(path)` then `Collection::load(path)` after restart; search and search_filtered behave as before save.
+
+- **Index file:** Binary format: type id (1 = HNSW), then graph parameters and all nodes (id, level, vector, neighbors). Old files without type id still load.
+- **Metadata file:** `Collection::save(path)` also writes `path.meta` with key-value metadata per vector. On load, we read both and repopulate Storage so search and filtered search work as before.
+- **Usage:** Call `collection.save(path)` before exit; after restart call `Collection::load(path)` to get back the same collection.
 
 ---
 
@@ -123,40 +135,39 @@ VecDB follows a layered database architecture separating query APIs, indexing, p
                                ▼
                     ┌──────────────────────┐
                     │      Collection      │
-                    │----------------------│
-                    │ • Public API         │
-                    │ • Metadata store     │
+                    │   (Public API)       │
+                    │ • insert/erase/update│
+                    │ • search_filtered    │
                     │ • Concurrency locks  │
-                    │ • Persistence        │
-                    │ • Transactions       │
+                    │ • save/load          │
                     └──────────┬───────────┘
                                │
-           ┌───────────────────┴───────────────────┐
-           ▼                                       ▼
-┌──────────────────────┐              ┌──────────────────────┐
-│      HNSWIndex       │              │         WAL          │
-│----------------------│              │----------------------│
-│ • Vector graph       │              │ BEGIN / INSERT       │
-│ • ANN search engine  │              │ COMMIT records       │
-│ • efSearch beam      │              │ Crash recovery       │
-│ • Binary persistence │              │ Replay on startup    │
-└──────────────────────┘              └──────────────────────┘
+           ┌───────────────────┼───────────────────┐
+           ▼                   ▼                    ▼
+┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
+│  InMemoryStorage │  │    IIndex        │  │       WAL        │
+│  (Data layer)    │  │  (e.g. HNSW)     │  │ BEGIN/INSERT/    │
+│ • put/get/erase  │  │ • insert/erase   │  │ COMMIT, replay   │
+│ • metadata       │  │ • search         │  └──────────────────┘
+└──────────────────┘  │ • save/load      │
+                      └──────────────────┘
 ```
 
 #### Component Responsibilities
 
-**Collection (database layer)**
+**Collection (public API)**
 
-Acts as the database coordinator:
-- exposes insert/search APIs
-- manages metadata
+Coordinates the database:
+- exposes insert, insert_batch, erase, update, search, search_filtered, save, load
+- uses **Storage** for vectors and metadata (single data layer)
+- uses **IIndex** for ANN search and persistence (no dynamic_cast on save)
 - handles concurrency (`std::shared_mutex`)
-- orchestrates persistence
-- integrates transactions and WAL
+- integrates transactions and WAL; commit applies the whole batch via one `insert_batch` (atomic)
 
-This layer separates database concerns from indexing logic.
+**Storage (data layer)**  
+`InMemoryStorage`: canonical vectors and metadata; Collection reads/writes through it.
 
-**HNSWIndex (search engine)**
+**IIndex / HNSWIndex (search engine)**
 
 Responsible only for similarity search:
 - hierarchical navigable small-world graph
@@ -177,10 +188,10 @@ Ensures crash safety:
 #### Request Flow
 
 **Insert (OLTP)**
-- Client → `Collection` → WAL append → `HNSWIndex::insert()`
+- Client → `Collection` → `Storage::put()` + `IIndex::insert()`; with transaction: WAL append then batch apply on commit.
 
 **Search**
-- Client → `Collection` → `HNSWIndex::search()` → metadata filter (optional)
+- Client → `Collection` → `IIndex::search()` → optional metadata filter (via Storage).
 
 **Recovery**
 - Startup → `WAL::replay()` → rebuild `Collection` state
@@ -189,17 +200,16 @@ Ensures crash safety:
 
 ## 4. Trade-offs & Future Improvements
 
+We list limitations and possible next steps so the design choices are clear.
+
 ### Trade-offs
-- **Collection::save/load** requires the index to be HNSWIndex (dynamic_cast); other index types would need their own save/load and a type id in the file for polymorphic load.
 - **Filtered search:** Implemented as “oversample (k×5) then filter in memory.” No index-level filtering; heavy filtering can hurt latency.
-- **Concurrency:** Single writer (insert/insert_batch) vs many readers (search) via `shared_mutex`; no transactions or multi-versioning.
+- **Concurrency:** Single writer (insert/insert_batch/erase/update) vs many readers (search) via `shared_mutex`; no multi-versioning.
 - **Parameters:** Defaults (e.g. M=16, efConstruction=50, efSearch=100) are tuned for small/medium datasets; large N may need different tuning.
-- **Storage vs index separation:** In this implementation the HNSW index owns the vectors and the graph, and `Collection` owns only metadata. There is no dedicated `Storage` layer that owns all data and lets indexes store only IDs, so swapping storage backends or adding more index types would require more refactoring.
-- **Pluggable index vs persistence:** The in-memory API is pluggable via `IIndex`, but on-disk persistence is tied to `HNSWIndex` (via `dynamic_cast`). Supporting a different ANN index that can also be saved/loaded would need a new format and some extra plumbing.
-- **Future direction (not implemented):** A more textbook design would give `Collection` a `Storage` (vectors + metadata) and one or more `IIndex` implementations that store only IDs and ask `Storage` for vectors. This would make it easier to add delete/update and multiple index types, at the cost of extra complexity.
+- **Index types:** Only HNSWIndex is implemented; the index file has a type id so additional index types can be added with their own save/load.
 
 ### Transactions & WAL
-- **Transactions:** Minimal, single-writer transactions via `Transaction` (no isolation levels, no MVCC).
+- **Transactions:** Minimal, single-writer transactions via `Transaction`. On commit, all pending inserts are applied in one `insert_batch` so the batch is visible atomically (no partial state).
 - **Durability:** Write-ahead log (`WAL`) with `BEGIN` / `INSERT` / `COMMIT` records; only fully committed transactions are replayed.
 - **Crash recovery:** On startup, `WAL::replay` replays committed transactions into a fresh `Collection`, then truncates the WAL to avoid double-application.
 
@@ -211,27 +221,67 @@ Ensures crash safety:
 
 ---
 
-## 5. Benchmark (optional)
+## 5. Benchmark and Brute-Force vs HNSW
+
+### Why we compare brute-force and HNSW
+
+A **naive** vector database would answer k-NN by scanning every vector (brute force). That is simple and **exact** but **does not scale**: search cost grows linearly with the number of vectors. The assignment asks for a **scalable** indexing algorithm. We implement **HNSW** (Hierarchical Navigable Small World) so that search is much faster on large collections, at the cost of **approximate** results. We keep a **brute-force** implementation in the codebase only to compute **ground-truth** results: when we run the benchmark, we compare HNSW’s answers to brute-force’s exact k-NN to report **Recall@k**. So the comparison is there to (1) show that HNSW scales better than brute force, and (2) measure how accurate the approximation is (recall).
+
+### Comparison table (Brute-Force vs HNSW)
+
+| Aspect | Brute-Force | HNSW (this implementation) |
+|--------|-------------|-----------------------------|
+| **Search time complexity** | O(N · d): must compare query to every vector | O(log N · M · d): graph traversal, sublinear in N |
+| **Insert time complexity** | O(1) per vector (no index) | O(log N · M · d) per vector (graph updates) |
+| **Recall** | 1.0 (exact k-NN) | Approximate (e.g. ~0.77 Recall@10 in our benchmark) |
+| **Scalability** | Poor: search gets slower as N grows | Good: search stays fast as N grows |
+| **Use in VecDB** | Used only to compute ground truth for recall; not exposed in the public API | Default index; used for all search in the Collection API |
+
+*N = number of vectors, d = dimension, M = HNSW graph degree.*
+
+In our benchmark run (5k vectors, dim=128, 100 queries, k=10), **HNSW** gave about **4.87 ms per query** and **Recall@10 ≈ 0.77**. A brute-force search over 5k vectors would be exact (Recall 1.0) but would do 5,000 distance computations per query and would get much slower as N grows; HNSW keeps search fast by using the graph instead of scanning all vectors.
+
+### How to run the benchmark
 
 Run `./vecdb_example` to get:
 
 - **Insert time** (ms) for 5k vectors, dim=128.
 - **Search time** total and per query (100 queries, k=10).
-- **Recall@10** vs brute-force ground truth.
+- **Recall@10** (HNSW results compared to brute-force ground truth).
 - **Persistence check:** save index, load, compare search results.
-- **Collection save/load with metadata:** save full collection, load, run filtered search to confirm metadata persisted.
+- **Collection save/load with metadata:** save full collection, load, run filtered search.
 - **Filtered search demo:** 100 vectors with `category` even/odd, query with `category=even`.
-- **WAL transaction demo:** commit a small transactional batch and verify it via filtered search.
+- **WAL transaction demo:** commit a small transactional batch and verify via filtered search.
 
-Single clean run on this machine (AppleClang 17, 5k vectors):
+**Latest run (build + ctest + vecdb_example):**
+
+Build:
+```text
+[ 63%] Built target vecdb
+[ 81%] Built target vecdb_example
+[100%] Built target vecdb_tests
+```
+
+Tests (`ctest` / `./vecdb_tests`):
+```text
+PASS: insert and search (n=200, k=5)
+PASS: persistence (save/load, result match)
+PASS: search_filtered (metadata filter)
+PASS: collection save/load with metadata
+PASS: insert_batch (OLAP-style bulk insert)
+PASS: WAL transactions replay (BEGIN/INSERT/COMMIT)
+All tests passed.
+```
+
+Benchmark (`./vecdb_example`, AppleClang 17, 5k vectors, dim=128):
 
 ```text
 ====================================
 Testing with 5000 vectors
 ====================================
-Insert time: 8796 ms
-Total search time: 518 ms
-Average per query: 5.18 ms
+Insert time: 8933 ms
+Total search time: 487 ms
+Average per query: 4.87 ms
 Recall@10: 0.766
 
 Persistence test (original vs loaded)
@@ -243,6 +293,8 @@ Filtered search (category=even, k=5) after load: 26 94 22 38 50
 
 Transaction + WAL demo:
 Committed tx_demo vectors, filtered search returned IDs: 100000 100001 
+
+VecDB Build Completed Successfully
 ```
 
 ---
@@ -250,17 +302,19 @@ Committed tx_demo vectors, filtered search returned IDs: 100000 100001
 ## 6. Project layout
 
 - `include/vecdb/` — Public API: `types.hpp`, `index.hpp`, `hnsw_index.hpp`, `collection.hpp`, `storage.hpp`
-- `src/` — Implementation: `hnsw_index.cpp`, `collection.cpp`, `storage.cpp`, `bruteforce.cpp`, `main.cpp` (benchmark + demo)
+- `src/` — Implementation: `hnsw_index.cpp`, `collection.cpp`, `storage.cpp`, `bruteforce.cpp` (used for recall evaluation only), `main.cpp` (benchmark + demo)
 - `tests/` — Unit and integration tests (see below)
 
 ---
 
 ## 7. Tests
 
-From `build/`:
+From the `build/` directory you can run all tests with:
 
 ```bash
 ctest
+# or run the test binary directly:
+./vecdb_tests
 ```
 
 Tests verify:
@@ -269,5 +323,6 @@ Tests verify:
 - **Search filtered:** Metadata filter returns only IDs matching key=value.
 - **Collection save/load with metadata:** Save collection (index + metadata), load, compare search results and filtered search.
 - **insert_batch:** Bulk insert with metadata; search and search_filtered work.
+- **WAL transactions replay:** Commit a transaction, restart, replay WAL; committed inserts are restored.
 
-See `tests/test_insert_search_persistence.cpp`.
+**Result:** 100% tests passed (1/1 CTest target; 6 test cases inside `vecdb_tests`). See `tests/test_insert_search_persistence.cpp`.

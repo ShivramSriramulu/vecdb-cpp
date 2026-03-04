@@ -1,6 +1,7 @@
 #include "vecdb/hnsw_index.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <fstream>
 #include <queue>
 #include <stdexcept>
@@ -338,12 +339,52 @@ std::vector<VectorID> HNSWIndex::search(const Vector& query, size_t k) {
     return final_result;
 }
 
+namespace {
+constexpr uint32_t kHNSWIndexTypeId = 1;
+}  // namespace
+
+std::optional<Vector> HNSWIndex::get_vector(VectorID id) const {
+    auto it = nodes_.find(id);
+    if (it == nodes_.end()) return std::nullopt;
+    return it->second.vector;
+}
+
+void HNSWIndex::erase(VectorID id) {
+    auto it = nodes_.find(id);
+    if (it == nodes_.end()) return;
+
+    for (auto& [nid, node] : nodes_) {
+        if (nid == id) continue;
+        for (auto& [level, neighs] : node.neighbors) {
+            neighs.erase(std::remove(neighs.begin(), neighs.end(), id),
+                         neighs.end());
+        }
+    }
+    nodes_.erase(it);
+
+    if (nodes_.empty()) {
+        entry_point_ = 0;
+        max_level_ = -1;
+        return;
+    }
+    if (entry_point_ == id) {
+        entry_point_ = nodes_.begin()->first;
+    }
+    max_level_ = -1;
+    for (const auto& [_, node] : nodes_) {
+        if (node.level > max_level_) max_level_ = node.level;
+    }
+}
+
 void HNSWIndex::save(const std::string& filename) const {
     std::ofstream out(filename, std::ios::binary);
 
     if (!out) {
         throw std::runtime_error("Failed to open file for writing");
     }
+
+    uint32_t type_id = kHNSWIndexTypeId;
+    out.write(reinterpret_cast<const char*>(&type_id), sizeof(type_id));
 
     out.write(reinterpret_cast<const char*>(&entry_point_), sizeof(entry_point_));
     out.write(reinterpret_cast<const char*>(&max_level_), sizeof(max_level_));
@@ -392,7 +433,17 @@ void HNSWIndex::load(const std::string& filename) {
 
     nodes_.clear();
 
-    in.read(reinterpret_cast<char*>(&entry_point_), sizeof(entry_point_));
+    uint32_t type_id = 0;
+    in.read(reinterpret_cast<char*>(&type_id), sizeof(type_id));
+    if (type_id != kHNSWIndexTypeId) {
+        // Backward compatibility: old format has no type_id; first 4 bytes are
+        // the low 32 bits of entry_point_ (little-endian).
+        uint32_t entry_high = 0;
+        in.read(reinterpret_cast<char*>(&entry_high), sizeof(entry_high));
+        entry_point_ = (uint64_t(type_id)) | (uint64_t(entry_high) << 32);
+    } else {
+        in.read(reinterpret_cast<char*>(&entry_point_), sizeof(entry_point_));
+    }
     in.read(reinterpret_cast<char*>(&max_level_), sizeof(max_level_));
     in.read(reinterpret_cast<char*>(&M_), sizeof(M_));
     in.read(reinterpret_cast<char*>(&efConstruction_), sizeof(efConstruction_));

@@ -42,9 +42,15 @@ void Transaction::insert(VectorID id,
 void Transaction::commit() {
     if (!active_) return;
 
+    std::vector<std::pair<VectorID, Vector>> items;
+    std::vector<Metadata> metas;
+    items.reserve(pending_.size());
+    metas.reserve(pending_.size());
     for (auto& op : pending_) {
-        collection_.insert(op.id, op.vec, op.meta);
+        items.emplace_back(op.id, op.vec);
+        metas.push_back(std::move(op.meta));
     }
+    collection_.insert_batch(items, metas);
 
     wal_.append("COMMIT");
     pending_.clear();

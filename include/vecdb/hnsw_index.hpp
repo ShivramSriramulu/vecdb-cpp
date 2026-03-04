@@ -1,9 +1,11 @@
- #pragma once
+#pragma once
 
 #include "index.hpp"
-#include <unordered_map>
+
+#include <optional>
 #include <random>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace vecdb {
@@ -20,10 +22,13 @@ public:
     HNSWIndex(int M = 16, int efConstruction = 200, int efSearch = 50);
 
     void insert(VectorID id, const Vector& vec) override;
+    void erase(VectorID id) override;
     std::vector<VectorID> search(const Vector& query, size_t k) override;
+    void save(const std::string& filename) const override;
+    void load(const std::string& filename) override;
 
-    void save(const std::string& filename) const;
-    void load(const std::string& filename);
+    /** Return stored vector for id (for persistence / storage sync). */
+    std::optional<Vector> get_vector(VectorID id) const;
 
 private:
     std::unordered_map<VectorID, Node> nodes_;
