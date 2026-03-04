@@ -207,9 +207,11 @@ We list limitations and possible next steps so the design choices are clear.
 - **Concurrency:** Single writer (insert/insert_batch/erase/update) vs many readers (search) via `shared_mutex`; no multi-versioning.
 - **Parameters:** Defaults (e.g. M=16, efConstruction=50, efSearch=100) are tuned for small/medium datasets; large N may need different tuning.
 - **Index types:** Only HNSWIndex is implemented; the index file has a type id so additional index types can be added with their own save/load.
+- **HNSW delete/update:** Delete and update are implemented (erase from graph + storage; update = erase then insert), but HNSW delete/update is **hard to do correctly** and **expensive**: removing a node leaves "dangling" edges in the graph, and we do not rewire neighbors. The graph can become less accurate over many deletes. A production system would need tombstoning, rewiring, or periodic rebuilds.
 
 ### Transactions & WAL
 - **Transactions:** Minimal, single-writer transactions via `Transaction`. On commit, all pending inserts are applied in one `insert_batch` so the batch is visible atomically (no partial state).
+- **Atomicity and crash semantics:** The "atomicity" claim depends on **crash point and WAL ordering**, not just the single lock. We write `BEGIN`, then `INSERT` records, then `COMMIT`. On replay we only apply transactions that have a matching `COMMIT`; if the process crashes after `INSERT`s but before `COMMIT`, those inserts are not replayed. So atomicity is "all or nothing" only when combined with this replay rule.
 - **Durability:** Write-ahead log (`WAL`) with `BEGIN` / `INSERT` / `COMMIT` records; only fully committed transactions are replayed.
 - **Crash recovery:** On startup, `WAL::replay` replays committed transactions into a fresh `Collection`, then truncates the WAL to avoid double-application.
 
